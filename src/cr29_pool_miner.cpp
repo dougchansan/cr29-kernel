@@ -1,26 +1,9 @@
 /**
  * CR29 Pool Miner - Full mining with stratum support
- * Includes: GPU trimming, cycle detection, pool connectivity
+ * Includes: GPU trimming, cycle detection, pool connectivity, TLS
  */
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#define _WINSOCK_DEPRECATED_NO_WARNINGS
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#pragma comment(lib, "ws2_32.lib")
-#else
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <unistd.h>
-#define SOCKET int
-#define INVALID_SOCKET -1
-#define SOCKET_ERROR -1
-#define closesocket close
-#endif
+#include "tls_socket.h"
 
 #include <CL/cl.h>
 #include <vector>
@@ -252,14 +235,15 @@ private:
 };
 
 // =============================================================================
-// Stratum Client - Pool connectivity
+// Stratum Client - Pool connectivity with TLS support
 // =============================================================================
 class StratumClient {
-    SOCKET sock = INVALID_SOCKET;
+    TlsSocket tlsSocket;
     std::string host;
     int port;
     std::string user;
     std::string pass;
+    bool useTls = false;
     std::atomic<bool> connected{false};
     std::mutex sendMutex;
 
@@ -280,76 +264,62 @@ public:
         std::atomic<uint64_t> graphsProcessed{0};
     } stats;
 
-    StratumClient(const std::string& h, int p, const std::string& u, const std::string& pw)
-        : host(h), port(p), user(u), pass(pw) {}
+    StratumClient(const std::string& h, int p, const std::string& u, const std::string& pw, bool tls = false)
+        : host(h), port(p), user(u), pass(pw), useTls(tls) {}
 
     ~StratumClient() {
         disconnect();
     }
 
     bool connect() {
-#ifdef _WIN32
-        WSADATA wsaData;
-        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-            std::cerr << "WSAStartup failed\n";
-            return false;
-        }
-#endif
+        std::cout << "Connecting to " << host << ":" << port;
+        if (useTls) std::cout << " (TLS)";
+        std::cout << "...\n";
+        std::cout.flush();
 
-        struct addrinfo hints = {}, *result;
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-
-        std::string portStr = std::to_string(port);
-        if (getaddrinfo(host.c_str(), portStr.c_str(), &hints, &result) != 0) {
-            std::cerr << "Failed to resolve " << host << "\n";
+        if (!tlsSocket.connect(host, port, useTls)) {
+            std::cerr << "Failed to connect" << (useTls ? " (TLS handshake failed?)" : "") << "\n";
             return false;
         }
 
-        sock = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
-        if (sock == INVALID_SOCKET) {
-            std::cerr << "Failed to create socket\n";
-            freeaddrinfo(result);
-            return false;
-        }
+        std::cout << "[STRATUM] TLS socket connected, setting connected=true\n";
+        std::cout.flush();
 
-        if (::connect(sock, result->ai_addr, (int)result->ai_addrlen) == SOCKET_ERROR) {
-            std::cerr << "Failed to connect to " << host << ":" << port << "\n";
-            closesocket(sock);
-            sock = INVALID_SOCKET;
-            freeaddrinfo(result);
-            return false;
-        }
-
-        freeaddrinfo(result);
         connected = true;
-        std::cout << "Connected to " << host << ":" << port << "\n";
+        std::cout << "Connected to " << host << ":" << port << (useTls ? " (TLS)" : "") << "\n";
+        std::cout.flush();
 
         // Send login
+        std::cout << "[STRATUM] Calling login()...\n";
+        std::cout.flush();
         return login();
     }
 
     void disconnect() {
-        if (sock != INVALID_SOCKET) {
-            closesocket(sock);
-            sock = INVALID_SOCKET;
-        }
+        tlsSocket.close();
         connected = false;
-#ifdef _WIN32
-        WSACleanup();
-#endif
     }
 
     bool isConnected() const { return connected; }
 
     bool login() {
+        std::cout << "[STRATUM] Sending login...\n";
+        std::cout.flush();
+
         // Grin stratum login format
         std::stringstream ss;
         ss << "{\"id\":" << messageId++ << ",\"jsonrpc\":\"2.0\",\"method\":\"login\","
            << "\"params\":{\"login\":\"" << user << "\",\"pass\":\"" << pass << "\","
            << "\"agent\":\"cr29-turbo/1.0\"}}\n";
 
-        return sendMessage(ss.str());
+        std::string msg = ss.str();
+        std::cout << "[STRATUM] Login message: " << msg;
+        std::cout.flush();
+
+        bool result = sendMessage(msg);
+        std::cout << "[STRATUM] Login sent: " << (result ? "success" : "failed") << "\n";
+        std::cout.flush();
+        return result;
     }
 
     bool submitShare(const std::string& jobId, uint64_t nonce, const std::vector<uint32_t>& proof) {
@@ -380,7 +350,7 @@ public:
 
     bool receiveAndProcess() {
         char buffer[4096];
-        int len = recv(sock, buffer, sizeof(buffer) - 1, 0);
+        int len = tlsSocket.recvData(buffer, sizeof(buffer) - 1);
         if (len <= 0) {
             connected = false;
             return false;
@@ -424,30 +394,44 @@ public:
             }
         }
 
-        // Extract pre_pow (header)
-        pos = json.find("\"pre_pow\"");
+        // Extract blob (Kryptex format) or pre_pow (Grin format)
+        pos = json.find("\"blob\"");
+        if (pos == std::string::npos) {
+            pos = json.find("\"pre_pow\"");
+        }
         if (pos != std::string::npos) {
-            pos = json.find("\"", pos + 10);
+            pos = json.find("\"", pos + 6);
             size_t end = json.find("\"", pos + 1);
             if (pos != std::string::npos && end != std::string::npos) {
                 std::string hex = json.substr(pos + 1, end - pos - 1);
                 currentHeader.clear();
-                for (size_t i = 0; i < hex.length(); i += 2) {
+                for (size_t i = 0; i + 1 < hex.length(); i += 2) {
                     currentHeader.push_back((uint8_t)strtol(hex.substr(i, 2).c_str(), nullptr, 16));
                 }
             }
         }
 
-        // Extract difficulty/target
-        pos = json.find("\"difficulty\"");
+        // Extract target (hex string) or difficulty (number)
+        pos = json.find("\"target\"");
         if (pos != std::string::npos) {
-            pos = json.find(":", pos);
+            pos = json.find("\"", pos + 9);
+            size_t end = json.find("\"", pos + 1);
+            if (pos != std::string::npos && end != std::string::npos) {
+                std::string hexTarget = json.substr(pos + 1, end - pos - 1);
+                currentTarget = strtoull(hexTarget.c_str(), nullptr, 16);
+            }
+        } else {
+            pos = json.find("\"difficulty\"");
             if (pos != std::string::npos) {
-                currentTarget = strtoull(json.c_str() + pos + 1, nullptr, 10);
+                pos = json.find(":", pos);
+                if (pos != std::string::npos) {
+                    currentTarget = strtoull(json.c_str() + pos + 1, nullptr, 10);
+                }
             }
         }
 
-        std::cout << "[JOB] New job: " << currentJobId << " difficulty=" << currentTarget << "\n";
+        std::cout << "[JOB] New job: " << currentJobId << " header_size=" << currentHeader.size()
+                  << " target=0x" << std::hex << currentTarget << std::dec << "\n";
     }
 
     bool getJob(std::string& jobId, std::vector<uint8_t>& header, uint64_t& target) {
@@ -461,8 +445,8 @@ public:
 
 private:
     bool sendMessage(const std::string& msg) {
-        if (sock == INVALID_SOCKET) return false;
-        int sent = send(sock, msg.c_str(), (int)msg.length(), 0);
+        if (!tlsSocket.isValid()) return false;
+        int sent = tlsSocket.sendData(msg.c_str(), (int)msg.length());
         return sent == (int)msg.length();
     }
 };
@@ -726,6 +710,7 @@ void printUsage(const char* prog) {
               << "  -u username      Mining username/wallet\n"
               << "  -p password      Mining password (default: x)\n"
               << "  -d device        GPU device index (default: 1)\n"
+              << "  --tls            Enable TLS encryption\n"
               << "  --benchmark      Run benchmark only (no pool)\n"
               << "  --verbose        Verbose output\n";
 }
@@ -735,6 +720,7 @@ int main(int argc, char** argv) {
     std::cout << "  CR29 Turbo Pool Miner v1.0\n";
     std::cout << "  RDNA 4 Optimized - 7.82 g/s\n";
     std::cout << "===========================================\n\n";
+    std::cout.flush();
 
     // Parse arguments
     std::string poolHost = "";
@@ -744,6 +730,7 @@ int main(int argc, char** argv) {
     int deviceIndex = 1;
     bool benchmark = false;
     bool verbose = false;
+    bool useTls = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -766,6 +753,8 @@ int main(int argc, char** argv) {
             benchmark = true;
         } else if (arg == "--verbose") {
             verbose = true;
+        } else if (arg == "--tls") {
+            useTls = true;
         } else if (arg == "-h" || arg == "--help") {
             printUsage(argv[0]);
             return 0;
@@ -849,9 +838,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::cout << "Connecting to " << poolHost << ":" << poolPort << "...\n";
+    std::cout << "Connecting to " << poolHost << ":" << poolPort;
+    if (useTls) std::cout << " (TLS)";
+    std::cout << "...\n";
+    std::cout.flush();
 
-    StratumClient stratum(poolHost, poolPort, user, pass);
+    StratumClient stratum(poolHost, poolPort, user, pass, useTls);
     if (!stratum.connect()) {
         std::cerr << "Failed to connect to pool\n";
         return 1;
