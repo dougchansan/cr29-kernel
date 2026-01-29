@@ -1,0 +1,18 @@
+# Build artifacts
+build/
+*.obj
+*.exe
+*.pdb
+*.ilk
+
+# Build logs
+build_error.txt
+build_output.txt
+
+# IDE/Editor
+.vs/
+.vscode/
+*.user
+
+# Claude
+.claude/
