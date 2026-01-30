@@ -1,0 +1,12 @@
+SHA3X Mining Demo Results
+========================
+Pool: xtm-c29-us.kryptex.network:8040
+Wallet: 12LfqTi7aQKz9cpxU1As...
+Worker: 9070xt
+Final Hashrate: 44.76 MH/s
+Total Shares: 15
+Accepted Shares: 14
+Rejected Shares: 1
+Acceptance Rate: 93.3%
+Status: SIMULATION COMPLETED
+Note: This was a demonstration run with simulated mining
